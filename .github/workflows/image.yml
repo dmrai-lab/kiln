@@ -1,0 +1,121 @@
+# The tessera images, built on this repository's minutes and pushed to the organisation's private packages:
+# ghcr.io/dmrai-lab/tessera:dmipy-sim-<commit> (coordinator + JAX GPU machines, x86-64),
+# ghcr.io/dmrai-lab/tessera-node:walker-<commit> (the JAX-free block-fill node, tagged by the dmipy-sim-cuda commit
+# whose release it carries) and ghcr.io/dmrai-lab/tessera-client (students). The Dockerfiles are tessera's own
+# (docker/Dockerfile, tessera/node/Dockerfile, docker/Dockerfile.client); neither image compiles the kernel, both
+# download dmipy-sim-cuda's per-commit release through docker/fetch_kernel.sh. The layer cache is a tag in the
+# private registry: nothing built here is readable from this repository.
+name: image
+on:
+  workflow_dispatch:
+    inputs:
+      tessera_ref:
+        description: "tessera branch, tag or commit to build"
+        required: true
+        default: main
+      dmipy_sim_commit:
+        description: "dmipy-sim commit the coordinator image pins (default: the Dockerfile's)"
+        required: false
+      dmipy_sim_cuda_commit:
+        description: "dmipy-sim-cuda commit whose release both images take the kernel from (default: the Dockerfiles')"
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: dmrai-lab/tessera
+          ref: ${{ inputs.tessera_ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: tessera
+      - name: Free disk (the CUDA wheels need ~10 GB before the trim)
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+      - name: Pins and tags
+        id: pin
+        working-directory: tessera
+        env:
+          SIM_IN: ${{ inputs.dmipy_sim_commit }}
+          CUDA_IN: ${{ inputs.dmipy_sim_cuda_commit }}
+          REF: ${{ inputs.tessera_ref }}
+        run: |
+          sim="$SIM_IN"; [ -n "$sim" ] || sim=$(sed -n 's/^ARG DMIPY_SIM_COMMIT=//p' docker/Dockerfile)
+          cuda="$CUDA_IN"; [ -n "$cuda" ] || cuda=$(sed -n 's/^ARG DMIPY_SIM_CUDA_COMMIT=//p' docker/Dockerfile | head -1)
+          sha=$(git rev-parse HEAD); main=false; [ "$REF" = main ] && main=true
+          { echo "sim=$sim"; echo "cuda=$cuda"; echo "sha=$sha"; echo "main=$main"; } >> "$GITHUB_OUTPUT"
+          echo "tessera $sha (main: $main), dmipy-sim $sim, dmipy-sim-cuda $cuda"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: tessera
+          file: tessera/docker/Dockerfile
+          platforms: linux/amd64
+          build-args: |
+            DMIPY_SIM_COMMIT=${{ steps.pin.outputs.sim }}
+            DMIPY_SIM_CUDA_COMMIT=${{ steps.pin.outputs.cuda }}
+          secrets: |
+            dmipy_sim_cuda_token=${{ secrets.SOURCE_TOKEN }}
+          cache-from: type=registry,ref=ghcr.io/dmrai-lab/tessera:buildcache
+          cache-to: type=registry,ref=ghcr.io/dmrai-lab/tessera:buildcache,mode=max
+          push: true
+          tags: |
+            ${{ steps.pin.outputs.main == 'true' && format('ghcr.io/dmrai-lab/tessera:dmipy-sim-{0}', steps.pin.outputs.sim) || '' }}
+            ghcr.io/dmrai-lab/tessera:dmipy-sim-${{ steps.pin.outputs.sim }}-${{ steps.pin.outputs.sha }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: tessera
+          file: tessera/docker/Dockerfile.client
+          platforms: linux/amd64,linux/arm64
+          push: ${{ steps.pin.outputs.main == 'true' }}
+          tags: ghcr.io/dmrai-lab/tessera-client:latest
+
+  node:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: dmrai-lab/tessera
+          ref: ${{ inputs.tessera_ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          path: tessera
+      - name: Pins and tags
+        id: pin
+        working-directory: tessera
+        env:
+          CUDA_IN: ${{ inputs.dmipy_sim_cuda_commit }}
+          REF: ${{ inputs.tessera_ref }}
+        run: |
+          cuda="$CUDA_IN"; [ -n "$cuda" ] || cuda=$(sed -n 's/^ARG DMIPY_SIM_CUDA_COMMIT=//p' tessera/node/Dockerfile | head -1)
+          sha=$(git rev-parse HEAD); main=false; [ "$REF" = main ] && main=true
+          { echo "cuda=$cuda"; echo "sha=$sha"; echo "main=$main"; } >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: tessera
+          file: tessera/tessera/node/Dockerfile
+          platforms: linux/amd64
+          build-args: DMIPY_SIM_CUDA_COMMIT=${{ steps.pin.outputs.cuda }}
+          secrets: |
+            dmipy_sim_cuda_token=${{ secrets.SOURCE_TOKEN }}
+          cache-from: type=registry,ref=ghcr.io/dmrai-lab/tessera-node:buildcache
+          cache-to: type=registry,ref=ghcr.io/dmrai-lab/tessera-node:buildcache,mode=max
+          push: true
+          tags: |
+            ${{ steps.pin.outputs.main == 'true' && format('ghcr.io/dmrai-lab/tessera-node:walker-{0}', steps.pin.outputs.cuda) || '' }}
+            ghcr.io/dmrai-lab/tessera-node:walker-${{ steps.pin.outputs.cuda }}-${{ steps.pin.outputs.sha }}
